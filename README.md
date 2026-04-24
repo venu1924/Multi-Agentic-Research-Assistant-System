@@ -63,6 +63,7 @@ The system follows a 5-agent architecture:
 --> Run the Project
 
 pip install -r requirements.txt
+
 streamlit run app/research_app2.py
 
 
