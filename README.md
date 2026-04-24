@@ -80,8 +80,3 @@ project/
 
 
 
-
-
-📜 License
-
-This project is developed for academic purposes.
