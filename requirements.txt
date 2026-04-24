@@ -5,10 +5,9 @@ seaborn
 numpy
 scikit-learn
 sentence-transformers
-transformers
-torch
 arxiv
 requests
 python-dotenv
 groq
 PyMuPDF
+rank-bm25
