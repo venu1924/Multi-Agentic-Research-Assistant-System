@@ -1,470 +1,265 @@
-from dotenv import load_dotenv
 import os
-from groq import Groq
-import time
 import re
+
+import fitz
 import requests
-import fitz  # PyMuPDF
+from dotenv import load_dotenv
+from groq import Groq
 
 load_dotenv()
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY")) if os.getenv("GROQ_API_KEY") else None
+_llm_failed = False
+
+FIELD_DEFAULTS = {
+    "problem": "Not specified",
+    "method": "Not specified",
+    "dataset": "Not specified",
+    "performance": "Not specified",
+    "application": "Not specified",
+    "limitations": "Not specified",
+}
+
+KEYWORD_GROUPS = {
+    "problem": ["problem", "challenge", "issue", "gap", "difficulty", "need", "limitation"],
+    "method": ["propose", "proposed", "model", "framework", "approach", "method", "architecture", "algorithm"],
+    "dataset": ["dataset", "benchmark", "evaluated on", "trained on", "tested on", "using the", "corpus"],
+    "performance": ["accuracy", "f1", "precision", "recall", "auc", "improvement", "outperform", "%"],
+    "application": ["application", "used for", "applied to", "task", "domain", "system"],
+    "limitations": ["limitations", "future work", "drawbacks", "constraint", "weakness", "fails", "limited"],
+}
+
+KNOWN_DATASETS = [
+    "ImageNet", "CIFAR-10", "CIFAR-100", "MNIST", "COCO", "KITTI", "nuScenes",
+    "Waymo", "SQuAD", "GLUE", "SuperGLUE", "MIMIC", "MIMIC-III", "MIMIC-IV",
+    "PhysioNet", "UCI", "KDD", "NSL-KDD", "UNSW-NB15", "CICIDS2017",
+]
 
 
-# =========================
-# CLEAN TEXT
-# =========================
-def clean_text(text):
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()[:4000]
+def clean_text(text, limit=9000):
+    text = re.sub(r"\s+", " ", text or "")
+    return text.strip()[:limit]
 
 
-# =========================
-# PDF FALLBACK (CRITICAL)
-# =========================
-def extract_pdf_text(url, max_pages=2):
+def _sentences(text):
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", clean_text(text, limit=20000))
+    cleaned = []
+    for part in parts:
+        part = part.strip(" -:\t\n")
+        words = part.split()
+        if 8 <= len(words) <= 70 and not part.endswith("-"):
+            cleaned.append(part)
+    return cleaned
+
+
+def extract_pdf_text(url, max_pages=8):
+    if not url:
+        return ""
+
     try:
-        r = requests.get(url, timeout=10)
-        doc = fitz.open(stream=r.content, filetype="pdf")
-
-        text = ""
-        for i, page in enumerate(doc):
-            if i >= max_pages:
-                break
-            text += page.get_text()
-
-        return clean_text(text)
-
-    except:
+        response = requests.get(url, timeout=12)
+        response.raise_for_status()
+        doc = fitz.open(stream=response.content, filetype="pdf")
+        text = " ".join(doc[i].get_text() for i in range(min(max_pages, len(doc))))
+        return clean_text(text, limit=6000)
+    except Exception:
         return ""
 
 
-# =========================
-# DATASET DETECTION
-# =========================
-def extract_dataset(text):
-    keywords = ["dataset", "benchmark", "kitti", "nuscenes", "waymo", "cifar", "imagenet"]
+def _score_sentence(sentence, field):
+    lower = sentence.lower()
+    score = 0
 
-    for sent in text.split("."):
-        if any(k in sent.lower() for k in keywords):
-            return sent.strip()
+    for keyword in KEYWORD_GROUPS[field]:
+        if keyword in lower:
+            score += 4 if " " in keyword else 2
 
+    if field == "performance" and re.search(r"\b\d+(\.\d+)?\s?%|\b0\.\d+\b", lower):
+        score += 5
+    if field == "dataset" and _dataset_names(sentence):
+        score += 5
+    if field == "limitations" and any(k in lower for k in ["future", "limited", "however", "although"]):
+        score += 3
+    if field == "method" and any(k in lower for k in ["we propose", "this paper proposes", "we present"]):
+        score += 4
+
+    # Penalize citation fragments, headings, and broken extraction noise.
+    if len(sentence.split()) < 10:
+        score -= 3
+    if re.search(r"\[[0-9,\s]+\]", sentence):
+        score -= 1
+    if sentence.count(",") > 8:
+        score -= 1
+
+    return score
+
+
+def _best_sentence(text, field):
+    ranked = sorted(
+        ((s, _score_sentence(s, field)) for s in _sentences(text)),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    if ranked and ranked[0][1] > 0:
+        return ranked[0][0]
     return "Not specified"
 
 
-# =========================
-# RESEARCH TYPE
-# =========================
-def detect_type(text):
-    t = text.lower()
+def _dataset_names(text):
+    names = []
+    for name in KNOWN_DATASETS:
+        if re.search(rf"\b{re.escape(name)}\b", text, flags=re.IGNORECASE):
+            names.append(name)
 
-    if "survey" in t or "review" in t:
-        return "Survey"
+    patterns = [
+        r"(?:evaluated|trained|tested|validated)\s+on\s+([A-Z][A-Za-z0-9_\-]+(?:\s+[A-Z][A-Za-z0-9_\-]+){0,3})",
+        r"(?:using|with)\s+the\s+([A-Z][A-Za-z0-9_\-]+(?:\s+[A-Z][A-Za-z0-9_\-]+){0,3})\s+(?:dataset|benchmark|corpus)",
+        r"([A-Z][A-Za-z0-9_\-]+(?:\s+[A-Z][A-Za-z0-9_\-]+){0,3})\s+(?:dataset|benchmark|corpus)",
+    ]
 
-    if "experiment" in t or "evaluation" in t:
-        return "Experimental"
+    for pattern in patterns:
+        for match in re.findall(pattern, text):
+            candidate = match.strip(" ,.;:")
+            if 2 <= len(candidate) <= 60 and candidate.lower() not in {"this", "our", "the"}:
+                names.append(candidate)
 
-    if "framework" in t or "model" in t:
-        return "Proposed Method"
-
-    return "Unknown"
+    return list(dict.fromkeys(names))
 
 
-# =========================
-# ROBUST PARSER (FIXED)
-# =========================
+def extract_dataset(text):
+    names = _dataset_names(text)
+    if names:
+        return ", ".join(names[:4])
+
+    sentence = _best_sentence(text, "dataset")
+    return sentence if sentence != "Not specified" else "Not specified"
+
+
+def extract_performance(text):
+    sentences = _sentences(text)
+    candidates = []
+    for sentence in sentences:
+        lower = sentence.lower()
+        has_metric = any(k in lower for k in KEYWORD_GROUPS["performance"])
+        has_number = bool(re.search(r"\b\d+(\.\d+)?\s?%|\b0\.\d+\b", lower))
+        has_comparison = any(k in lower for k in ["outperform", "improve", "better", "state-of-the-art", "compared"])
+        if has_metric and (has_number or has_comparison):
+            candidates.append((sentence, _score_sentence(sentence, "performance")))
+
+    if candidates:
+        return sorted(candidates, key=lambda item: item[1], reverse=True)[0][0]
+    return _best_sentence(text, "performance")
+
+
+
 def parse_output(text):
+    fields = dict(FIELD_DEFAULTS)
+    current_key = None
 
-    fields = {
-        "problem": "Not specified",
-        "method": "Not specified",
-        "dataset": "Not specified",
-        "performance": "Not specified",
-        "application": "Not specified",
-        "limitations": "Not specified"
-    }
-
-    for line in text.split("\n"):
-
-        if ":" not in line:
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip().strip("-")
+        if not line:
             continue
 
-        key, value = line.split(":", 1)
+        match = re.match(r"^(problem|method|dataset|performance|application|limitations)\s*:\s*(.*)$", line, re.I)
+        if match:
+            current_key = match.group(1).lower()
+            value = match.group(2).strip()
+            if value:
+                fields[current_key] = value
+            continue
 
-        key = key.strip().lower()
-        value = value.strip()
-
-        if key in fields and value:
-            fields[key] = value
+        if current_key and fields[current_key] == "Not specified":
+            fields[current_key] = line
 
     return fields
 
 
-# =========================
-# FALLBACK (STRONG)
-# =========================
-def fallback(p, text):
-
-    sentences = text.split(".")
+def _heuristic_analysis(paper, text):
+    abstract = paper.get("abstract", "")
+    useful_text = clean_text(f"{abstract} {text}", limit=12000)
 
     return {
-        "title": p.get("title", ""),
-        "problem": sentences[0] if len(sentences) > 0 else "Not specified",
-        "method": sentences[1] if len(sentences) > 1 else "Not specified",
-        "dataset": extract_dataset(text),
-        "performance": next((s for s in sentences if "accuracy" in s.lower()), "Not specified"),
-        "application": "General application inferred",
-        "limitations": "Not explicitly stated",
-        "research_type": detect_type(text)
+        "title": paper.get("title", ""),
+        "problem": _best_sentence(useful_text, "problem"),
+        "method": _best_sentence(useful_text, "method"),
+        "dataset": extract_dataset(useful_text),
+        "performance": extract_performance(useful_text),
+        "application": _best_sentence(useful_text, "application"),
+        "limitations": _best_sentence(useful_text, "limitations"),
     }
 
 
-# =========================
-# MAIN FUNCTION
-# =========================
-def analyze_paper(p):
+def _merge_with_heuristics(parsed, heuristics):
+    merged = {}
+    for key in FIELD_DEFAULTS:
+        value = parsed.get(key, "Not specified")
+        if not value or value.lower() in {"not specified", "none", "n/a"}:
+            value = heuristics.get(key, "Not specified")
+        merged[key] = value or "Not specified"
+    return merged
 
-    # 🔥 STEP 1: USE TITLE + ABSTRACT
-    text = (p.get("title", "") + " " + p.get("abstract", ""))
 
-    # 🔥 STEP 2: PDF fallback if weak
-    if len(text) < 500 and p.get("pdf_url"):
-        text += " " + extract_pdf_text(p["pdf_url"])
+def analyze_paper(paper):
+    global _llm_failed
 
-    text = clean_text(text)
+    title = paper.get("title", "")
+    abstract = paper.get("abstract", "")
+    pdf_text = extract_pdf_text(paper.get("pdf_url"), max_pages=8) if paper.get("pdf_url") else ""
 
-    # 🔥 STEP 3: STRICT PROMPT
+    source_text = clean_text(
+        f"Title: {title}\n\nAbstract: {abstract}\n\nFirst PDF pages: {pdf_text}",
+        limit=9000,
+    )
+    heuristics = _heuristic_analysis(paper, source_text)
+
+    if client is None or _llm_failed:
+        return heuristics
+
     prompt = f"""
-Extract EXACTLY in this format:
+Extract high-quality structured research information from the paper text.
 
-Problem: <one line>
-Method: <one line>
-Dataset: <one line>
-Performance: <one line>
-Application: <one line>
-Limitations: <one line>
+Return exactly this format:
+Problem: <specific challenge or research gap, one sentence>
+Method: <specific proposed method/framework/model, one sentence>
+Dataset: <dataset/benchmark names or evaluation setting; Not specified if absent>
+Performance: <metrics, numerical results, or comparison/improvement; Not specified if absent>
+Application: <main task/domain/use case, one sentence>
+Limitations: <stated limitation, constraint, weakness, or future work; Not specified if absent>
 
 Rules:
-- MUST follow exact format
-- One line per field
-- No extra explanation
-- If missing → "Not specified"
+- Prefer the abstract, then use the first PDF pages for missing context.
+- Select complete, informative sentences; do not copy broken fragments.
+- Use only the supplied text.
+- Avoid generic phrases such as "the paper discusses".
 
-Text:
-{text}
+Paper text:
+{source_text}
 """
 
     try:
-        if client is None:
-            return fallback(p, text)
-
-        res = client.chat.completions.create(
+        response = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0
+            temperature=0,
+            max_tokens=650,
         )
-
-        output = res.choices[0].message.content
-
-        parsed = parse_output(output)
-
-        return {
-            "title": p.get("title", ""),
-            "problem": parsed["problem"],
-            "method": parsed["method"],
-            "dataset": parsed["dataset"] if parsed["dataset"] != "Not specified" else extract_dataset(text),
-            "performance": parsed["performance"],
-            "application": parsed["application"],
-            "limitations": parsed["limitations"],
-            "research_type": detect_type(text)
-        }
-
+        parsed = parse_output(response.choices[0].message.content)
+        fields = _merge_with_heuristics(parsed, heuristics)
     except Exception:
-        return fallback(p, text)
-
-
-# =========================
-# MULTIPLE
-# =========================
-def analyze_multiple(papers):
-    return [analyze_paper(p) for p in papers]
-
-
-
-
-
-import os
-from groq import Groq
-from dotenv import load_dotenv
-
-load_dotenv()
-
-api_key = os.getenv("GROQ_API_KEY")
-client = Groq(api_key=api_key) if api_key else None
-
-
-# =========================
-# 🔥 VALIDATION (RELAXED + SMART)
-# =========================
-def is_valid_output(text):
-    t = text.lower()
-
-    conditions = [
-        any(k in t for k in ["while", "whereas", "however"]),  # comparison signal
-        any(k in t for k in ["clinical", "healthcare", "decision"]),  # domain signal
-    ]
-
-    return sum(conditions) >= 1
-
-
-# =========================
-# 🔥 FALLBACK (SAFE + DOMAIN-AWARE)
-# =========================
-def fallback_reasoning(analyses):
-
-    insights = []
-    gaps = []
-    recs = []
-
-    insights.append(
-        "While some approaches focus on integrating AI into clinical workflows, others emphasize explainable models, indicating a gap between system usability and interpretability."
-    )
-
-    insights.append(
-        "Whereas explainability is highlighted as essential for trust, fairness is not explicitly evaluated, suggesting a disconnect between interpretability and ethical deployment."
-    )
-
-    gaps.append("Fairness and bias evaluation is not systematically addressed in most studies.")
-    gaps.append("Datasets and performance metrics are not consistently reported.")
-    gaps.append("Real-world clinical deployment is not sufficiently evaluated.")
-
-    recs.append("Future work should integrate explainability directly into clinical workflows.")
-    recs.append("Fairness-aware evaluation metrics must be incorporated into CDSS models.")
-    recs.append("Standardized datasets and benchmarking protocols should be used.")
-
-    return "\n".join(insights), "\n".join(gaps), "\n".join(recs)
-
-
-# =========================
-# 🔥 PARSER (ROBUST)
-# =========================
-def parse_output(text):
-
-    insights, gaps, recs = "", "", ""
-    current = None
-
-    for line in text.split("\n"):
-        l = line.strip()
-
-        if not l:
-            continue
-
-        upper = l.upper()
-
-        if upper.startswith("INSIGHTS"):
-            current = "i"
-            continue
-        elif upper.startswith("GAPS"):
-            current = "g"
-            continue
-        elif upper.startswith("RECOMMENDATIONS"):
-            current = "r"
-            continue
-
-        if current == "i":
-            insights += l + "\n"
-        elif current == "g":
-            gaps += l + "\n"
-        elif current == "r":
-            recs += l + "\n"
-
-    return insights.strip(), gaps.strip(), recs.strip()
-
-
-# =========================
-# 🔥 MAIN FUNCTION
-# =========================
-def generate_insights(analyses):
-
-    if not analyses:
-        return fallback_reasoning(analyses)
-
-    # =========================
-    # 🔥 BUILD PAIRWISE INPUT
-    # =========================
-    paired = ""
-
-    for i in range(len(analyses) - 1):
-        a = analyses[i]
-        b = analyses[i + 1]
-
-        paired += f"""
-Paper A:
-Title: {a.get('title','')}
-Method: {a.get('method','')}
-Dataset: {a.get('dataset','')}
-Performance: {a.get('performance','')}
-Limitations: {a.get('limitations','')}
-
-Paper B:
-Title: {b.get('title','')}
-Method: {b.get('method','')}
-Dataset: {b.get('dataset','')}
-Performance: {b.get('performance','')}
-Limitations: {b.get('limitations','')}
-
----
-"""
-
-    # =========================
-    # 🔥 FINAL PROMPT
-    # =========================
-    prompt = f"""
-Perform HIGH-LEVEL CROSS-PAPER ANALYSIS.
-
-STRICT RULES:
-- Compare papers using words like "while", "whereas", or "however"
-- DO NOT summarize papers individually
-- Identify at least ONE contradiction
-- Analyze fairness (present OR missing)
-- Use ONLY given data
-- Avoid generic statements
-
-INSIGHTS:
-- Compare methods across papers
-- Explain WHY differences exist
-- Highlight trade-offs (trust vs performance, explainability vs usability)
-
-GAPS:
-- Identify missing elements:
-  - fairness evaluation
-  - dataset transparency
-  - real-world deployment
-- Explain impact of each gap
-
-RECOMMENDATIONS:
-- Must directly address identified gaps
-- Must be actionable and technical
-
-OUTPUT FORMAT:
-
-INSIGHTS:
-- ...
-
-GAPS:
-- ...
-
-RECOMMENDATIONS:
-- ...
-
-PAPERS:
-{paired}
-"""
-
-    # =========================
-    # 🔥 RETRY LOOP
-    # =========================
-    final_text = ""
-
-    for attempt in range(2):
-        try:
-            res = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3
-            )
-
-            text = res.choices[0].message.content
-
-            if is_valid_output(text):
-                final_text = text
-                break
-            else:
-                print("⚠️ Weak reasoning → retrying...")
-
-        except Exception as e:
-            print("LLM Error:", e)
-
-    # =========================
-    # 🔥 USE BEST AVAILABLE OUTPUT
-    # =========================
-    if not final_text:
-        return fallback_reasoning(analyses)
-
-    insights, gaps, recs = parse_output(final_text)
-
-    # final safety check
-    if not insights.strip():
-        return fallback_reasoning(analyses)
-
-    return insights, gaps, recs
-
-
-
-import arxiv
-import re
-from collections import defaultdict
-from datetime import datetime
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-
-
-def build_arxiv_query(user_query):
-
-    query = user_query.lower()
-
-    stop_words = {
-        "in", "for", "of", "and", "the",
-        "with", "on", "using", "applications", "application"
+        _llm_failed = True
+        fields = heuristics
+
+    return {
+        "title": title,
+        "problem": fields["problem"],
+        "method": fields["method"],
+        "dataset": fields["dataset"],
+        "performance": fields["performance"],
+        "application": fields["application"],
+        "limitations": fields["limitations"],
     }
 
-    words = re.findall(r'\b\w+\b', query)
 
-    keywords = [w for w in words if w not in stop_words]
-
-    return " AND ".join(keywords[:5])
-
-
-def fetch_trend_data(query):
-
-    search_query = build_arxiv_query(query)
-
-    search = arxiv.Search(
-        query=f"(ti:{search_query} OR abs:{search_query}) AND cat:cs.*",
-        max_results=300,
-        sort_by=arxiv.SortCriterion.SubmittedDate
-    )
-
-    year_counts = defaultdict(int)
-
-    try:
-        for result in arxiv.Client().results(search):
-            year = result.published.year
-            if year >= 2019:
-                year_counts[year] += 1
-    except Exception as e:
-        print("Trend error:", e)
-
-    current_year = datetime.now().year
-    years = list(range(2019, current_year + 1))
-
-    return [(str(y), year_counts.get(y, 0)) for y in years]
-
-
-def compute_metrics(analyses, papers, query):
-
-    texts = [
-        (a.get("problem", "") + " " +
-         a.get("method", "") + " " +
-         a.get("application", ""))
-        for a in analyses
-    ]
-
-    vectorizer = TfidfVectorizer(stop_words='english')
-    tfidf = vectorizer.fit_transform(texts)
-
-    similarity = cosine_similarity(tfidf)
-
-    trends = fetch_trend_data(query)
-
-    return similarity, trends
+def analyze_multiple(papers):
+    return [analyze_paper(paper) for paper in papers]

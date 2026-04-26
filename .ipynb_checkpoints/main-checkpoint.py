@@ -1,70 +1,94 @@
-from agents.query_domain_agent import refine_query
-from agents.retrieval_filter_agent import retrieve_papers
-from agents.ranking_agent import rank_papers
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+
 from agents.analysis_reasoning_agent import analyze_multiple
+from agents.query_domain_agent import refine_query
+from agents.ranking_agent import rank_papers
+from agents.retrieval_filter_agent import retrieve_papers
 from agents.synthesis_insight_agent import generate_insights
 
-from sklearn.metrics.pairwise import cosine_similarity
-from sentence_transformers import SentenceTransformer
-import numpy as np
 
-
-# =========================
-# SIMILARITY
-# =========================
 def compute_similarity(papers):
-    model = SentenceTransformer("all-MiniLM-L6-v2")
+    if not papers:
+        return np.array([])
+    if len(papers) == 1:
+        return np.array([[1.0]])
 
-    texts = [p["title"] + " " + p["abstract"] for p in papers]
-    emb = model.encode(texts)
-
-    sim = cosine_similarity(emb)
-    return np.round(sim, 2)
-
-
-# =========================
-# TRENDS
-# =========================
-def compute_trends(papers):
-    year_count = {}
-
-    for p in papers:
-        y = p.get("year", 0)
-        year_count[y] = year_count.get(y, 0) + 1
-
-    return sorted(year_count.items())
+    try:
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        texts = [
+            f"{paper.get('title', '')} {paper.get('abstract', '')}".strip()
+            for paper in papers
+        ]
+        embeddings = model.encode(texts)
+        return np.round(cosine_similarity(embeddings), 2)
+    except Exception as exc:
+        print("Similarity error:", exc)
+        return np.eye(len(papers))
 
 
-# =========================
-# MAIN PIPELINE
-# =========================
-def run_pipeline(query, max_papers=5, time_filter="All"):
+def _normalize_paper(paper):
+    normalized = dict(paper)
+    normalized.setdefault("title", "Untitled")
+    normalized.setdefault("abstract", "")
+    normalized.setdefault("year", "")
+    normalized.setdefault("authors", [])
+    normalized.setdefault("pdf_url", None)
+    return normalized
 
+def _is_uploaded_paper(paper):
+    title = paper.get("title", "")
+    authors = paper.get("authors", [])
+    return title.startswith("[Uploaded]") or "User Uploaded" in authors
+
+
+
+def run_pipeline(query, max_papers=5, time_filter="All", focus="general", papers=None):
     retrieval_query = refine_query(query)
 
-    papers = retrieve_papers(
-        retrieval_query,
-        max_results=max_papers * 3,
-        time_filter=time_filter
-    )
+    if papers is None:
+        candidate_papers = retrieve_papers(
+            retrieval_query,
+            max_results=max_papers * 3,
+            time_filter=time_filter,
+        )
+    else:
+        candidate_papers = [_normalize_paper(paper) for paper in papers]
 
-    if not papers:
-        return {}
+    if not candidate_papers:
+        return {
+            "papers": [],
+            "analyses": [],
+            "insights": "",
+            "comparison": [],
+            "gaps": "",
+            "recommendations": "",
+            "similarity": np.array([]),
+        }
 
-    ranked = rank_papers(query, papers, max_papers)
+    ranking_query = f"{query} {focus}".strip()
 
-    # 🔥 ANALYSIS
+    uploaded_papers = [paper for paper in candidate_papers if _is_uploaded_paper(paper)]
+    retrieved_papers = [paper for paper in candidate_papers if not _is_uploaded_paper(paper)]
+
+    if uploaded_papers:
+        ranked = rank_papers(ranking_query, retrieved_papers, max_papers) if retrieved_papers else []
+        for uploaded in uploaded_papers:
+            uploaded["score"] = uploaded.get("score", 1.0)
+            ranked.append(uploaded)
+        for index, paper in enumerate(ranked, start=1):
+            paper["rank"] = index
+    else:
+        ranked = rank_papers(ranking_query, candidate_papers, max_papers)
+
     analyses = analyze_multiple(ranked)
 
-    for i, p in enumerate(ranked):
-        p["fields"] = analyses[i]
+    for index, paper in enumerate(ranked):
+        paper["fields"] = analyses[index] if index < len(analyses) else {}
 
-    # 🔥 INSIGHTS
-    comparison, insights, gaps, recs = generate_insights(analyses)
-
-    # 🔥 VISUALS
+    comparison, insights, gaps, recommendations = generate_insights(analyses)
     similarity = compute_similarity(ranked)
-    trends = compute_trends(ranked)
 
     return {
         "papers": ranked,
@@ -72,7 +96,6 @@ def run_pipeline(query, max_papers=5, time_filter="All"):
         "insights": insights,
         "comparison": comparison,
         "gaps": gaps,
-        "recommendations": recs,
+        "recommendations": recommendations,
         "similarity": similarity,
-        "trends": trends
     }
